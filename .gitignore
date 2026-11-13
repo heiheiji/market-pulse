@@ -1,0 +1,13 @@
+# 本地敏感配置，绝不入库
+secrets.json
+monitor.log
+chrome-profile/
+_probe/
+node_modules/
+package.json
+package-lock.json
+
+# 探针产生的样例数据
+sample-*.json
+
+# state.json 需要入库：云端靠 git 提交在 job 之间传递状态
