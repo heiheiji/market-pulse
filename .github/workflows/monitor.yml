@@ -1,0 +1,55 @@
+name: scheduled-sync
+
+# 每 30 分钟拉起一次，每次跑 25 分钟（内部 90 秒轮询）。
+# concurrency 保证同一时间只有一个 job，cron 延迟时后一个会排队而不是并发。
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "本次运行秒数（调试用，留空则按 1680）"
+        required: false
+        default: "1680"
+
+concurrency:
+  group: binance-lead-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 环境自检
+        run: |
+          google-chrome --version
+          node -v
+
+      - name: 运行监控
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MONITOR_NO_PROXY: "1"
+          CHROME_PATH: google-chrome
+          MONITOR_PROFILE: /tmp/chrome-profile
+          MONITOR_LOG: /tmp/monitor.log
+        run: node monitor.js --duration ${{ github.event.inputs.duration || '1680' }}
+
+      - name: 提交状态
+        if: always()
+        run: |
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
