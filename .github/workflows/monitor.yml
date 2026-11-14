@@ -1,16 +1,20 @@
 name: scheduled-sync
 
-# 每 30 分钟拉起一次，每次跑 25 分钟（内部 90 秒轮询）。
-# concurrency 保证同一时间只有一个 job，cron 延迟时后一个会排队而不是并发。
+# 运行窗口：UTC 00:00–17:00（北京时间 08:00–次日 01:00）
+# 单次最多跑 5.5 小时，结束时用 PAT 触发下一次，形成接力链条。
+# 下面三条 cron 只是"点火开关"和断链兜底——GitHub 的 schedule 本身不可靠。
+
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 0 * * *"
+    - cron: "0 6 * * *"
+    - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
       duration:
-        description: "本次运行秒数（调试用，留空则按 1680）"
+        description: "覆盖本次运行秒数（调试用，留空按窗口计算）"
         required: false
-        default: "1680"
+        default: ""
 
 concurrency:
   group: binance-lead-monitor
@@ -22,7 +26,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -30,12 +34,32 @@ jobs:
         with:
           node-version: "22"
 
-      - name: 环境自检
+      - name: 计算运行窗口
+        id: win
         run: |
-          google-chrome --version
-          node -v
+          OVERRIDE="${{ github.event.inputs.duration }}"
+          if [ -n "$OVERRIDE" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "duration=$OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "调试模式：运行 $OVERRIDE 秒"
+            exit 0
+          fi
+          STOP=$(date -u -d "today 17:00" +%s)
+          NOW=$(date +%s)
+          REMAIN=$((STOP - NOW))
+          echo "现在 $(date -u '+%F %T') UTC｜窗口结束 $(date -u -d @$STOP '+%F %T') UTC｜剩余 ${REMAIN}s"
+          if [ "$REMAIN" -le 120 ]; then
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "已过运行窗口，退出"
+          else
+            D=$(( REMAIN < 19800 ? REMAIN : 19800 ))
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "duration=$D" >> "$GITHUB_OUTPUT"
+            echo "本次运行 ${D}s"
+          fi
 
       - name: 运行监控
+        if: steps.win.outputs.run == 'yes'
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -43,7 +67,7 @@ jobs:
           CHROME_PATH: google-chrome
           MONITOR_PROFILE: /tmp/chrome-profile
           MONITOR_LOG: /tmp/monitor.log
-        run: node monitor.js --duration ${{ github.event.inputs.duration || '1680' }}
+        run: node monitor.js --duration ${{ steps.win.outputs.duration }}
 
       - name: 提交状态
         if: always()
@@ -52,4 +76,17 @@ jobs:
           git config user.email "monitor-bot@users.noreply.github.com"
           git add state.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          git push
+          git push || (git pull --rebase origin main && git push)
+
+      - name: 接力下一次
+        if: always() && steps.win.outputs.run == 'yes'
+        env:
+          GH_PAT: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          curl -sS -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: monitor-bot" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/monitor.yml/dispatches" \
+            -d '{"ref":"main"}' \
+            -o /dev/null -w "dispatch -> HTTP %{http_code}\n"
